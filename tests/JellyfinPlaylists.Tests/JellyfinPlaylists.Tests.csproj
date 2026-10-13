@@ -1,62 +1,22 @@
-using Xunit;
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
 
-namespace JellyfinPlaylists.Tests;
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
 
-public sealed class PlaylistCatalogTests
-{
-    [Fact]
-    public void DefaultTargets_IncludesPriorityPlaylists()
-    {
-        var targets = PlaylistCatalog.HighPriorityTargets;
-
-        Assert.Contains(targets, target => target.Name.Contains("Arrowverse", StringComparison.OrdinalIgnoreCase));
-        Assert.Contains(targets, target => target.Name.Contains("Marvel", StringComparison.OrdinalIgnoreCase));
-    }
-
-    [Fact]
-    public void NormalizeName_HandlesPunctuationAndCase()
-    {
-        var normalized = PlaylistMatchHelper.NormalizeName("The Flash - 2014");
-
-        Assert.Equal("the flash 2014", normalized);
-    }
-
-    [Fact]
-    public void VideoFilter_IgnoresMusic()
-    {
-        var items = new[]
-        {
-            new LibraryItemRecord(
-                "movie-1",
-                "The Avengers",
-                "The Avengers",
-                LibraryItemType.Movie,
-                null,
-                null,
-                "/media/movies/the-avengers.mkv",
-                "2012-05-04",
-                null,
-                null,
-                null,
-                ["Action"]),
-            new LibraryItemRecord(
-                "music-1",
-                "The Soundtrack",
-                "The Soundtrack",
-                LibraryItemType.Music,
-                null,
-                null,
-                "/media/music/the-soundtrack.mp3",
-                null,
-                null,
-                null,
-                null,
-                ["Rock"]) 
-        };
-
-        var filtered = LibraryItemFilters.FilterVideoLibrary(items).ToArray();
-
-        Assert.Single(filtered);
-        Assert.Equal(LibraryItemType.Movie, filtered[0].ItemType);
-    }
-}
+  <ItemGroup>
+    <ProjectReference Include="../../src/JellyfinPlaylists/JellyfinPlaylists.csproj" />
+  </ItemGroup>
+</Project>
