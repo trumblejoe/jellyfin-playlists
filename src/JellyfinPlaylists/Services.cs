@@ -243,40 +243,39 @@ public sealed class PlaylistAnalyzer : IPlaylistAnalyzer
     {
         var definition = PlaylistDefinitionCatalog.GetByName(playlistName);
         var filteredLibrary = libraryItems
-            .Where(item => item.ItemType is LibraryItemType.Movie or LibraryItemType.Series or LibraryItemType.Episode)
-            .Where(item => MatchesTarget(item, definition))
+            .Where(LibraryItemFilters.IsVideoOnly)
+            .Where(item => PlaylistMatchHelper.MatchesDefinition(item, definition))
             .ToArray();
 
         var trackingByPlaylist = trackingItems
             .Where(item => string.Equals(item.PlaylistName, playlistName, StringComparison.OrdinalIgnoreCase))
             .ToArray();
 
-        var trackedIds = trackingByPlaylist
-            .Where(item => !string.IsNullOrWhiteSpace(item.ItemId))
-            .Select(item => item.ItemId)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var trackedNames = trackingByPlaylist
-            .Where(item => !string.IsNullOrWhiteSpace(item.ItemName))
-            .Select(item => PlaylistMatchHelper.NormalizeName(item.ItemName!))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
         var present = new List<PlaylistGap>();
         var missing = new List<PlaylistGap>();
 
         foreach (var item in filteredLibrary)
         {
-            var trackedById = trackedIds.Contains(item.Id);
-            var trackedByName = trackedNames.Contains(PlaylistMatchHelper.NormalizeName(item.Name));
-            var isPresent = trackedById || trackedByName;
+            var bestMatch = trackingByPlaylist
+                .Select(trackingItem => new
+                {
+                    TrackingItem = trackingItem,
+                    Score = PlaylistMatchHelper.ScoreLibraryItemMatch(item, trackingItem)
+                })
+                .Where(x => x.Score >= 70d)
+                .OrderByDescending(x => x.Score)
+                .FirstOrDefault();
 
+            var isPresent = bestMatch is not null;
             var gap = new PlaylistGap(
                 PlaylistName: playlistName,
                 ItemId: item.Id,
                 ItemName: item.Name,
                 ParentId: item.ParentId,
                 IsMissing: !isPresent,
-                Reason: isPresent ? "Tracked in playlist" : "Not found in playlist tracking");
+                Reason: isPresent
+                    ? $"Tracked in playlist ({bestMatch.Score:F1})"
+                    : "Not found in playlist tracking");
 
             if (isPresent)
             {
@@ -297,30 +296,6 @@ public sealed class PlaylistAnalyzer : IPlaylistAnalyzer
             CompletionPercent: completionPercent,
             IsComplete: missing.Count == 0));
     }
-
-    private static bool MatchesTarget(LibraryItemRecord item, PlaylistDefinition? definition)
-    {
-        if (definition is null)
-        {
-            return true;
-        }
-
-        var normalizedName = PlaylistMatchHelper.NormalizeName(item.Name);
-        var matchesKeyword = definition.Keywords
-            .Select(PlaylistMatchHelper.NormalizeName)
-            .Any(keyword => keyword.Length > 0 && normalizedName.Contains(keyword, StringComparison.Ordinal));
-
-        if (!matchesKeyword)
-        {
-            return false;
-        }
-
-        var excluded = definition.ExcludedKeywords
-            .Select(PlaylistMatchHelper.NormalizeName)
-            .Any(keyword => keyword.Length > 0 && normalizedName.Contains(keyword, StringComparison.Ordinal));
-
-        return !excluded;
-    }
 }
 
 public sealed class ChronologicalPlaylistBuilder : IChronologicalPlaylistBuilder
@@ -331,6 +306,7 @@ public sealed class ChronologicalPlaylistBuilder : IChronologicalPlaylistBuilder
     {
         return items
             .OrderBy(item => GetSortDate(item))
+            .ThenBy(item => PlaylistMatchHelper.ParseEpisodeOrder(item.Name))
             .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
@@ -402,4 +378,39 @@ public sealed class JellyfinPlaylistEngine
     {
         return _chronologicalBuilder.OrderChronologically(items, playlistName);
     }
+
+    public async Task<JellyfinPlaylistExecutionResult> ExecuteAsync(
+        string libraryDatabasePath,
+        string trackingDatabasePath,
+        CancellationToken cancellationToken = default)
+    {
+        var libraryItems = await _libraryReader.LoadLibraryAsync(libraryDatabasePath, cancellationToken);
+        var trackingItems = await _trackingReader.LoadTrackingAsync(trackingDatabasePath, cancellationToken);
+
+        var reports = new Dictionary<string, PlaylistCompletionReport>(StringComparer.OrdinalIgnoreCase);
+        var orderedPlaylists = new Dictionary<string, IReadOnlyCollection<LibraryItemRecord>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var definition in PlaylistDefinitionCatalog.All)
+        {
+            var filteredItems = libraryItems
+                .Where(LibraryItemFilters.IsVideoOnly)
+                .Where(item => PlaylistMatchHelper.MatchesDefinition(item, definition))
+                .ToArray();
+
+            var report = await _playlistAnalyzer.AnalyzeAsync(definition.Name, filteredItems, trackingItems, cancellationToken);
+            reports[definition.Name] = report;
+            orderedPlaylists[definition.Name] = _chronologicalBuilder.OrderChronologically(filteredItems, definition.Name);
+        }
+
+        return new JellyfinPlaylistExecutionResult(reports, orderedPlaylists);
+    }
+}
+
+public sealed record JellyfinPlaylistExecutionResult(
+    IReadOnlyDictionary<string, PlaylistCompletionReport> Reports,
+    IReadOnlyDictionary<string, IReadOnlyCollection<LibraryItemRecord>> OrderedPlaylists)
+{
+    public int HighPriorityMissingCount =>
+        Reports.Where(pair => PlaylistDefinitionCatalog.GetByName(pair.Key)?.Priority >= PlaylistPriority.High)
+            .Sum(pair => pair.Value.MissingItems.Count);
 }
