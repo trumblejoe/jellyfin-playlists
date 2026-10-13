@@ -1,3 +1,6 @@
+using System.Data;
+using Microsoft.Data.Sqlite;
+
 namespace JellyfinPlaylists;
 
 public interface ILibraryDatabaseReader
@@ -28,20 +31,205 @@ public interface IChronologicalPlaylistBuilder
 
 public sealed class LibraryDatabaseReader : ILibraryDatabaseReader
 {
-    public Task<IReadOnlyCollection<LibraryItemRecord>> LoadLibraryAsync(string databasePath, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyCollection<LibraryItemRecord>> LoadLibraryAsync(
+        string databasePath,
+        CancellationToken cancellationToken = default)
     {
-        // Placeholder: this will be implemented against the Jellyfin SQLite database.
-        // Only movies and TV content should be returned; music and other media types are ignored.
-        return Task.FromResult<IReadOnlyCollection<LibraryItemRecord>>([]);
+        if (string.IsNullOrWhiteSpace(databasePath))
+        {
+            throw new ArgumentException("A Jellyfin library database path is required.", nameof(databasePath));
+        }
+
+        var items = new List<LibraryItemRecord>();
+
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync(cancellationToken);
+
+        var sql = @"
+            SELECT
+                Id,
+                Name,
+                SortName,
+                Type,
+                ParentId,
+                SeriesId,
+                Path,
+                PremiereDate,
+                ProductionYear,
+                ProviderIds,
+                LibraryId,
+                Genres
+            FROM BaseItems
+            WHERE IsFolder = 0
+              AND Type IN ('Movie', 'Series', 'Episode');";
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var typeName = GetString(reader, "Type");
+            var itemType = typeName?.Trim() switch
+            {
+                "Movie" => LibraryItemType.Movie,
+                "Series" => LibraryItemType.Series,
+                "Episode" => LibraryItemType.Episode,
+                _ => LibraryItemType.Unknown
+            };
+
+            if (itemType == LibraryItemType.Unknown)
+            {
+                continue;
+            }
+
+            items.Add(new LibraryItemRecord(
+                Id: GetString(reader, "Id") ?? Guid.NewGuid().ToString("N"),
+                Name: GetString(reader, "Name") ?? "Unknown",
+                SortName: GetString(reader, "SortName"),
+                ItemType: itemType,
+                ParentId: GetString(reader, "ParentId"),
+                SeriesId: GetString(reader, "SeriesId"),
+                Path: GetString(reader, "Path"),
+                ReleaseDate: GetString(reader, "PremiereDate") ?? GetString(reader, "ProductionYear"),
+                PremiereDate: GetString(reader, "PremiereDate"),
+                ProviderId: GetString(reader, "ProviderIds"),
+                LibraryId: GetString(reader, "LibraryId"),
+                Genres: ParseGenres(GetString(reader, "Genres"))));
+        }
+
+        return items;
+    }
+
+    private static string? GetString(IDataReader reader, string columnName)
+    {
+        var ordinal = reader.GetOrdinal(columnName);
+        if (reader.IsDBNull(ordinal))
+        {
+            return null;
+        }
+
+        return reader.GetValue(ordinal) switch
+        {
+            string s => s,
+            long l => l.ToString(),
+            int i => i.ToString(),
+            _ => reader.GetValue(ordinal)?.ToString()
+        };
+    }
+
+    private static string[] ParseGenres(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return Array.Empty<string>();
+        }
+
+        return value
+            .Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
     }
 }
 
 public sealed class PlaylistTrackingReader : IPlaylistTrackingReader
 {
-    public Task<IReadOnlyCollection<PlaylistTrackingRecord>> LoadTrackingAsync(string databasePath, CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyCollection<PlaylistTrackingRecord>> LoadTrackingAsync(
+        string databasePath,
+        CancellationToken cancellationToken = default)
     {
-        // Placeholder: this will read tracking metadata and playlist assignments from the configured data source.
-        return Task.FromResult<IReadOnlyCollection<PlaylistTrackingRecord>>([]);
+        if (string.IsNullOrWhiteSpace(databasePath))
+        {
+            throw new ArgumentException("A playlist tracking database path is required.", nameof(databasePath));
+        }
+
+        var results = new List<PlaylistTrackingRecord>();
+
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync(cancellationToken);
+
+        var tableNames = await GetTableNamesAsync(connection, cancellationToken);
+        var tableName = tableNames.Contains("PlaylistTracking", StringComparer.OrdinalIgnoreCase)
+            ? "PlaylistTracking"
+            : tableNames.Contains("PlaylistItems", StringComparer.OrdinalIgnoreCase)
+                ? "PlaylistItems"
+                : null;
+
+        if (tableName is null)
+        {
+            return results;
+        }
+
+        var sql = $@"
+            SELECT
+                PlaylistName,
+                ItemId,
+                ItemName,
+                ItemType,
+                AddedAt,
+                IsPresent,
+                ExternalId
+            FROM {tableName};";
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            results.Add(new PlaylistTrackingRecord(
+                PlaylistName: GetNullableString(reader, "PlaylistName") ?? "Unknown",
+                ItemId: GetNullableString(reader, "ItemId") ?? string.Empty,
+                ItemName: GetNullableString(reader, "ItemName"),
+                SourceType: GetNullableString(reader, "ItemType"),
+                AddedAt: GetNullableDateTimeOffset(reader, "AddedAt"),
+                IsPresent: !reader.IsDBNull(reader.GetOrdinal("IsPresent")) && reader.GetBoolean(reader.GetOrdinal("IsPresent")),
+                ExternalId: GetNullableString(reader, "ExternalId")));
+        }
+
+        return results;
+    }
+
+    private static async Task<HashSet<string>> GetTableNamesAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var tableNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table';";
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            tableNames.Add(reader.GetString(0));
+        }
+
+        return tableNames;
+    }
+
+    private static string? GetNullableString(IDataReader reader, string columnName)
+    {
+        var ordinal = reader.GetOrdinal(columnName);
+        return reader.IsDBNull(ordinal) ? null : reader.GetValue(ordinal)?.ToString();
+    }
+
+    private static DateTimeOffset? GetNullableDateTimeOffset(IDataReader reader, string columnName)
+    {
+        var ordinal = reader.GetOrdinal(columnName);
+        if (reader.IsDBNull(ordinal))
+        {
+            return null;
+        }
+
+        var value = reader.GetValue(ordinal);
+        return value switch
+        {
+            DateTime dt => new DateTimeOffset(dt),
+            DateTimeOffset dto => dto,
+            string str when DateTimeOffset.TryParse(str, out var parsed) => parsed,
+            _ => null
+        };
     }
 }
 
@@ -53,54 +241,165 @@ public sealed class PlaylistAnalyzer : IPlaylistAnalyzer
         IReadOnlyCollection<PlaylistTrackingRecord> trackingItems,
         CancellationToken cancellationToken = default)
     {
+        var definition = PlaylistDefinitionCatalog.GetByName(playlistName);
         var filteredLibrary = libraryItems
             .Where(item => item.ItemType is LibraryItemType.Movie or LibraryItemType.Series or LibraryItemType.Episode)
+            .Where(item => MatchesTarget(item, definition))
             .ToArray();
 
-        var missing = filteredLibrary
-            .Select(item => new PlaylistGap(
-                playlistName,
-                item.Id,
-                item.Name,
-                item.ParentId,
-                true,
-                "Not found in playlist tracking"))
+        var trackingByPlaylist = trackingItems
+            .Where(item => string.Equals(item.PlaylistName, playlistName, StringComparison.OrdinalIgnoreCase))
             .ToArray();
 
-        var present = Array.Empty<PlaylistGap>();
-        var completionPercent = missing.Length == 0 && filteredLibrary.Count == 0 ? 100d : 0d;
+        var trackedIds = trackingByPlaylist
+            .Where(item => !string.IsNullOrWhiteSpace(item.ItemId))
+            .Select(item => item.ItemId)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var trackedNames = trackingByPlaylist
+            .Where(item => !string.IsNullOrWhiteSpace(item.ItemName))
+            .Select(item => PlaylistMatchHelper.NormalizeName(item.ItemName!))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var present = new List<PlaylistGap>();
+        var missing = new List<PlaylistGap>();
+
+        foreach (var item in filteredLibrary)
+        {
+            var trackedById = trackedIds.Contains(item.Id);
+            var trackedByName = trackedNames.Contains(PlaylistMatchHelper.NormalizeName(item.Name));
+            var isPresent = trackedById || trackedByName;
+
+            var gap = new PlaylistGap(
+                PlaylistName: playlistName,
+                ItemId: item.Id,
+                ItemName: item.Name,
+                ParentId: item.ParentId,
+                IsMissing: !isPresent,
+                Reason: isPresent ? "Tracked in playlist" : "Not found in playlist tracking");
+
+            if (isPresent)
+            {
+                present.Add(gap);
+            }
+            else
+            {
+                missing.Add(gap);
+            }
+        }
+
+        var completionPercent = filteredLibrary.Length == 0 ? 100d : (present.Count * 100d) / filteredLibrary.Length;
 
         return Task.FromResult(new PlaylistCompletionReport(
-            playlistName,
-            missing,
-            present,
-            completionPercent,
-            false));
+            PlaylistName: playlistName,
+            MissingItems: missing,
+            PresentItems: present,
+            CompletionPercent: completionPercent,
+            IsComplete: missing.Count == 0));
+    }
+
+    private static bool MatchesTarget(LibraryItemRecord item, PlaylistDefinition? definition)
+    {
+        if (definition is null)
+        {
+            return true;
+        }
+
+        var normalizedName = PlaylistMatchHelper.NormalizeName(item.Name);
+        var matchesKeyword = definition.Keywords
+            .Select(PlaylistMatchHelper.NormalizeName)
+            .Any(keyword => keyword.Length > 0 && normalizedName.Contains(keyword, StringComparison.Ordinal));
+
+        if (!matchesKeyword)
+        {
+            return false;
+        }
+
+        var excluded = definition.ExcludedKeywords
+            .Select(PlaylistMatchHelper.NormalizeName)
+            .Any(keyword => keyword.Length > 0 && normalizedName.Contains(keyword, StringComparison.Ordinal));
+
+        return !excluded;
     }
 }
 
 public sealed class ChronologicalPlaylistBuilder : IChronologicalPlaylistBuilder
 {
-    public IReadOnlyCollection<LibraryItemRecord> OrderChronologically(IReadOnlyCollection<LibraryItemRecord> items, string playlistName)
+    public IReadOnlyCollection<LibraryItemRecord> OrderChronologically(
+        IReadOnlyCollection<LibraryItemRecord> items,
+        string playlistName)
     {
         return items
-            .OrderBy(item => ParseYear(item.ReleaseDate ?? item.PremiereDate ?? "0000-01-01"))
+            .OrderBy(item => GetSortDate(item))
             .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
 
-    private static int ParseYear(string value)
+    private static DateTimeOffset GetSortDate(LibraryItemRecord item)
     {
-        if (string.IsNullOrWhiteSpace(value))
+        foreach (var candidate in new[] { item.ReleaseDate, item.PremiereDate })
         {
-            return int.MaxValue;
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+
+            if (DateTimeOffset.TryParse(candidate, out var parsed))
+            {
+                return parsed;
+            }
+
+            if (int.TryParse(candidate, out var year))
+            {
+                return new DateTimeOffset(year, 1, 1, 0, 0, 0, TimeSpan.Zero);
+            }
         }
 
-        if (DateTimeOffset.TryParse(value, out var parsed))
+        return DateTimeOffset.MaxValue;
+    }
+}
+
+public sealed class JellyfinPlaylistEngine
+{
+    private readonly ILibraryDatabaseReader _libraryReader;
+    private readonly IPlaylistTrackingReader _trackingReader;
+    private readonly IPlaylistAnalyzer _playlistAnalyzer;
+    private readonly IChronologicalPlaylistBuilder _chronologicalBuilder;
+
+    public JellyfinPlaylistEngine(
+        ILibraryDatabaseReader? libraryReader = null,
+        IPlaylistTrackingReader? trackingReader = null,
+        IPlaylistAnalyzer? playlistAnalyzer = null,
+        IChronologicalPlaylistBuilder? chronologicalBuilder = null)
+    {
+        _libraryReader = libraryReader ?? new LibraryDatabaseReader();
+        _trackingReader = trackingReader ?? new PlaylistTrackingReader();
+        _playlistAnalyzer = playlistAnalyzer ?? new PlaylistAnalyzer();
+        _chronologicalBuilder = chronologicalBuilder ?? new ChronologicalPlaylistBuilder();
+    }
+
+    public async Task<IReadOnlyDictionary<string, PlaylistCompletionReport>> AnalyzePlaylistsAsync(
+        string libraryDatabasePath,
+        string trackingDatabasePath,
+        CancellationToken cancellationToken = default)
+    {
+        var libraryItems = await _libraryReader.LoadLibraryAsync(libraryDatabasePath, cancellationToken);
+        var trackingItems = await _trackingReader.LoadTrackingAsync(trackingDatabasePath, cancellationToken);
+
+        var results = new Dictionary<string, PlaylistCompletionReport>(StringComparer.OrdinalIgnoreCase);
+        foreach (var definition in PlaylistDefinitionCatalog.All)
         {
-            return parsed.Year;
+            var report = await _playlistAnalyzer.AnalyzeAsync(definition.Name, libraryItems, trackingItems, cancellationToken);
+            results[definition.Name] = report;
         }
 
-        return int.MaxValue;
+        return results;
+    }
+
+    public IReadOnlyCollection<LibraryItemRecord> BuildOrderedPlaylist(
+        string playlistName,
+        IReadOnlyCollection<LibraryItemRecord> items)
+    {
+        return _chronologicalBuilder.OrderChronologically(items, playlistName);
     }
 }
