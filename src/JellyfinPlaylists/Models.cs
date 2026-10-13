@@ -1,5 +1,3 @@
-using System.ComponentModel;
-
 namespace JellyfinPlaylists;
 
 public enum LibraryItemType
@@ -51,7 +49,7 @@ public sealed record PlaylistDefinition(
     bool IncludeMovies,
     bool IncludeSeries,
     bool IncludeEpisodes,
-    int? TargetCount);
+    int? TargetCount = null);
 
 public sealed record PlaylistGap(
     string PlaylistName,
